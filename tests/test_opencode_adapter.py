@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -322,3 +325,220 @@ def test_write_refuses_symlink(tmp_path: Path) -> None:
     assert result["errors"]
     assert target.read_text(encoding="utf-8").startswith("---")
     assert module.GENERATED_MARKER not in target.read_text(encoding="utf-8")
+
+
+SKILLS = ROOT / "skills"
+AGENTS = ROOT / "agents"
+EXTENSIONS = ROOT / "extensions"
+WRAPPERS = ADAPTER / "agents"
+HUB = SKILLS / "seo" / "SKILL.md"
+AUDIT = SKILLS / "seo-audit" / "SKILL.md"
+
+
+GENERATOR = load_generator()
+split_frontmatter = GENERATOR.split_frontmatter
+discover_agents = GENERATOR.discover_agents
+
+
+def parse_wrapper(path: Path) -> dict[str, object]:
+    text = path.read_text(encoding="utf-8")
+    frontmatter, _ = split_frontmatter(text)
+    data: dict[str, object] = {"permissions": []}
+    for line in frontmatter.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("mode:"):
+            data["mode"] = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("steps:"):
+            data["steps"] = int(stripped.split(":", 1)[1].strip())
+        elif stripped.startswith("description:"):
+            data["description"] = json.loads(stripped.split(":", 1)[1].strip())
+        elif stripped.startswith("- {") and "action:" in stripped:
+            body = stripped.removeprefix("- {").removesuffix("}")
+            rule = {}
+            for part in body.split(","):
+                key, value = part.split(":", 1)
+                rule[key.strip()] = value.strip().strip('"')
+            data["permissions"].append(rule)
+    return data
+
+
+def source_map() -> dict[str, object]:
+    return {agent.id: agent for agent in discover_agents(ROOT)}
+
+
+def test_wrapper_coverage() -> None:
+    sources = source_map()
+    assert "seo-matomo" in sources
+    assert {p.stem for p in WRAPPERS.glob("*.md")} == set(sources)
+
+
+def test_wrapper_frontmatter_parity() -> None:
+    sources = source_map()
+    for path in sorted(WRAPPERS.glob("seo-*.md")):
+        text = path.read_text(encoding="utf-8")
+        frontmatter, _ = split_frontmatter(text)
+        keys = {
+            line.split(":", 1)[0]
+            for line in frontmatter.splitlines()
+            if line and not line.startswith((" ", "-"))
+        }
+        for key in ("tools", "name", "model", "maxTurns"):
+            assert key not in keys, (path, key)
+        data = parse_wrapper(path)
+        assert data["mode"] == "subagent", path
+        source = sources[path.stem]
+        assert data["description"] == source.description, path
+        assert data["steps"] == source.max_turns + 1, path
+        assert source.source.as_posix() in text, path
+        assert str(ROOT) not in text, path
+
+
+TOOL_ACTIONS = {
+    "Read": "read",
+    "Bash": "shell",
+    "Write": "edit",
+    "Glob": "glob",
+    "Grep": "grep",
+    "WebFetch": "webfetch",
+    "WebSearch": "websearch",
+}
+
+
+def expected_actions(source) -> set[str]:
+    actions = {TOOL_ACTIONS[tool] for tool in source.tools if tool in TOOL_ACTIONS}
+    actions.add("skill")
+    return actions
+
+
+def test_permissions_mapping() -> None:
+    sources = source_map()
+    for path in sorted(WRAPPERS.glob("seo-*.md")):
+        data = parse_wrapper(path)
+        rules = data["permissions"]
+        source = sources[path.stem]
+        assert rules[0] == {"action": "*", "resource": "*", "effect": "deny"}, path
+        assert rules[-1] == {
+            "action": "skill",
+            "resource": "seo*",
+            "effect": "allow",
+        }, path
+        allowed = {rule["action"] for rule in rules if rule["effect"] == "allow"}
+        assert allowed == expected_actions(source), path
+        assert {"action": "read", "resource": "*.env", "effect": "ask"} in rules, path
+        assert {"action": "read", "resource": "*.env.*", "effect": "ask"} in rules, path
+        assert {
+            "action": "read",
+            "resource": "*.env.example",
+            "effect": "allow",
+        } in rules, path
+
+    assert "shell" not in expected_actions(sources["seo-flow"])
+    assert "edit" not in expected_actions(sources["seo-flow"])
+    assert "shell" not in expected_actions(sources["seo-cluster"])
+    assert "websearch" in expected_actions(sources["seo-cluster"])
+    assert "webfetch" in expected_actions(sources["seo-cluster"])
+    for agent_id in ("seo-schema", "seo-visual"):
+        assert "webfetch" not in expected_actions(sources[agent_id])
+        assert "websearch" not in expected_actions(sources[agent_id])
+    assert "shell" in expected_actions(sources["seo-technical"])
+    assert "edit" in expected_actions(sources["seo-technical"])
+    assert "webfetch" not in expected_actions(sources["seo-technical"])
+
+
+def test_wrapper_body_has_no_literal_placeholder_command() -> None:
+    sources = source_map()
+    for path in sorted(WRAPPERS.glob("seo-*.md")):
+        text = path.read_text(encoding="utf-8")
+        data = parse_wrapper(path)
+        actions = {rule["action"] for rule in data["permissions"] if rule["effect"] == "allow"}
+        assert "${CLAUDE_PLUGIN_ROOT}/scripts" not in text, path
+        assert str(ROOT) not in text, path
+        assert sources[path.stem].source.as_posix() in text, path
+        if "shell" in actions:
+            assert "./scripts/claude-seo" in text, path
+        else:
+            assert "no shell access" in text, path
+            assert "Run bundled tools as" not in text, path
+
+
+def test_hub_agents_have_wrappers() -> None:
+    names = set()
+    hub_text = HUB.read_text(encoding="utf-8")
+    for line in hub_text.splitlines():
+        if "spawn" in line.lower():
+            names.update(re.findall(r"\b(seo-[a-z0-9-]+)\b", line))
+    subagents = hub_text.split("## Subagents", 1)[1].split("## ", 1)[0]
+    names.update(re.findall(r"^- `(seo-[a-z0-9-]+)`", subagents, re.M))
+    audit_text = AUDIT.read_text(encoding="utf-8")
+    names.update(re.findall(r"`(seo-[a-z0-9-]+)`", audit_text))
+    assert names
+    assert "seo-matomo" in names
+    missing = names - {p.stem for p in WRAPPERS.glob("*.md")}
+    assert not missing, missing
+
+
+def test_skill_ids_are_discoverable() -> None:
+    skill_paths = sorted(SKILLS.glob("*/SKILL.md"))
+    assert skill_paths
+    assert (SKILLS / "seo" / "SKILL.md").is_file()
+    for path in skill_paths:
+        assert re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", path.parent.name), path
+        frontmatter, _ = split_frontmatter(path.read_text(encoding="utf-8"))
+        assert re.search(r"^description:\s*\S", frontmatter, re.M), path
+
+
+def test_placeholder_scan() -> None:
+    paths = list(AGENTS.glob("seo-*.md"))
+    paths += list(SKILLS.glob("*/SKILL.md"))
+    paths += list(SKILLS.glob("*/references/**/*.md"))
+    paths += list(EXTENSIONS.glob("*/agents/seo-*.md"))
+    paths += list(EXTENSIONS.glob("*/skills/*/SKILL.md"))
+    paths += list(EXTENSIONS.glob("*/skills/*/references/**/*.md"))
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        assert "${CLAUDE_PLUGIN_DATA}" not in text, path
+        assert "${CLAUDE_SEO_DATA_DIR}" not in text, path
+        assert not re.search(r"\$CLAUDE_PLUGIN_ROOT(?!\{)", text), path
+
+
+def test_launcher_exists() -> None:
+    launcher = ROOT / "scripts" / "claude-seo"
+    assert launcher.is_file()
+    assert (ROOT / "scripts" / "runtime.py").is_file()
+    if os.name != "nt":
+        assert os.access(launcher, os.X_OK)
+
+
+def test_generated_freshness() -> None:
+    result = subprocess.run(
+        [sys.executable, str(ADAPTER_SCRIPT), "--check"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_runtime_files_have_no_absolute_paths() -> None:
+    runtime = [
+        ADAPTER / "opencode.json",
+        ADAPTER / "instructions.md",
+        ADAPTER / "commands" / "seo.md",
+    ]
+    runtime += sorted(WRAPPERS.glob("*.md"))
+    for path in runtime:
+        text = path.read_text(encoding="utf-8")
+        assert "/opt/" not in text, path
+        assert "/Users/" not in text, path
+
+
+def test_consistency_check_passes() -> None:
+    result = subprocess.run(
+        [sys.executable, "scripts/consistency_check.py", "--json"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
