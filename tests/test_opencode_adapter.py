@@ -542,3 +542,18 @@ def test_consistency_check_passes() -> None:
         timeout=120,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.skipif(
+    os.environ.get("OPENCODE_LIVE") != "1",
+    reason="set OPENCODE_LIVE=1 to run the live OpenCode check",
+)
+def test_live_opencode() -> None:
+    result = subprocess.run(
+        [sys.executable, ".opencode/adapter/live_check.py"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=600,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
