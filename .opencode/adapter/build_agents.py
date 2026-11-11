@@ -61,6 +61,23 @@ def split_frontmatter(text: str) -> tuple[str, str]:
 
 
 def _strip_inline_comment(value: str) -> str:
+    if value.startswith(('"', "'")):
+        quote = value[0]
+        escaped = False
+        for index in range(1, len(value)):
+            char = value[index]
+            if escaped:
+                escaped = False
+                continue
+            if char == "\\" and quote == '"':
+                escaped = True
+                continue
+            if char == quote:
+                rest = value[index + 1 :]
+                if rest.strip().startswith("#"):
+                    return value[: index + 1]
+                return value
+        return value
     marker = value.find(" #")
     if marker >= 0:
         return value[:marker].rstrip()
@@ -191,7 +208,12 @@ def _read_agent(path: Path, root: Path) -> AgentSource:
 
 def discover_agents(root: Path) -> list[AgentSource]:
     """Return unique agent sources, core first, then extensions."""
-    core_paths = sorted((root / "agents").glob("seo-*.md"), key=lambda path: path.name)
+    agents_dir = root / "agents"
+    if not agents_dir.is_dir():
+        raise ValueError(f"missing agent source directory: {agents_dir}")
+    core_paths = sorted(agents_dir.glob("seo-*.md"), key=lambda path: path.name)
+    if not core_paths:
+        raise ValueError(f"no agent sources found under {agents_dir}")
     extension_paths = sorted(
         (root / "extensions").glob("*/agents/seo-*.md"), key=lambda path: path.as_posix()
     )
@@ -281,6 +303,18 @@ def _sources(root: Path) -> list[dict[str, str]]:
     return [{"id": agent.id, "source": agent.source.as_posix()} for agent in discover_agents(root)]
 
 
+def _symlink_component(path: Path, root: Path) -> Path | None:
+    """Return the first symlink between root and path, if any."""
+    current = path
+    root = root.resolve()
+    while True:
+        if current.is_symlink():
+            return current
+        if current == root or current == current.parent:
+            return None
+        current = current.parent
+
+
 def _result(errors: list[str], sources: list[dict[str, str]]) -> dict[str, object]:
     return {
         "written": [],
@@ -305,6 +339,9 @@ def check_wrappers(root: Path) -> dict[str, object]:
         if not ID_RE.fullmatch(agent_id):
             errors.append(f"invalid agent id: {agent_id!r}")
     output = root / ".opencode" / "agents"
+    link = _symlink_component(output, root)
+    if link is not None:
+        errors.append(f"refusing to use symlinked output path: {link}")
     missing: list[str] = []
     changed: list[str] = []
     stale: list[str] = []
@@ -349,6 +386,9 @@ def write_wrappers(root: Path) -> dict[str, object]:
     output = root / ".opencode" / "agents"
     if not output.resolve().is_relative_to(root.resolve()):
         errors.append(f"output directory escapes the repository root: {output}")
+    link = _symlink_component(output, root)
+    if link is not None:
+        errors.append(f"refusing to use symlinked output path: {link}")
     existing: dict[str, Path] = {}
     if output.is_dir():
         for path in sorted(output.glob("*.md")):

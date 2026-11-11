@@ -424,13 +424,24 @@ def test_permissions_mapping() -> None:
         }, path
         allowed = {rule["action"] for rule in rules if rule["effect"] == "allow"}
         assert allowed == expected_actions(source), path
-        assert {"action": "read", "resource": "*.env", "effect": "ask"} in rules, path
-        assert {"action": "read", "resource": "*.env.*", "effect": "ask"} in rules, path
-        assert {
+        read_allow = next(
+            index
+            for index, rule in enumerate(rules)
+            if rule == {"action": "read", "resource": "*", "effect": "allow"}
+        )
+        env_ask = {"action": "read", "resource": "*.env", "effect": "ask"}
+        env_ask_glob = {"action": "read", "resource": "*.env.*", "effect": "ask"}
+        env_example = {
             "action": "read",
             "resource": "*.env.example",
             "effect": "allow",
-        } in rules, path
+        }
+        assert read_allow < rules.index(env_ask), path
+        assert read_allow < rules.index(env_ask_glob), path
+        assert read_allow < rules.index(env_example), path
+        assert env_ask in rules, path
+        assert env_ask_glob in rules, path
+        assert env_example in rules, path
 
     assert "shell" not in expected_actions(sources["seo-flow"])
     assert "edit" not in expected_actions(sources["seo-flow"])
@@ -459,6 +470,7 @@ def test_wrapper_body_has_no_literal_placeholder_command() -> None:
         else:
             assert "no shell access" in text, path
             assert "Run bundled tools as" not in text, path
+            assert "./scripts/claude-seo" not in text, path
 
 
 def test_hub_agents_have_wrappers() -> None:
@@ -557,3 +569,46 @@ def test_live_opencode() -> None:
         timeout=600,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_write_refuses_empty_source_set(tmp_path: Path) -> None:
+    module = load_generator()
+    root = fixture_root(tmp_path)
+    module.write_wrappers(root)
+    for path in sorted((root / "agents").glob("seo-*.md")):
+        path.unlink()
+    result = module.write_wrappers(root)
+    assert result["errors"]
+    assert len(list((root / ".opencode" / "agents").glob("*.md"))) == 3
+
+
+def test_quoted_description_with_hash_is_not_truncated(tmp_path: Path) -> None:
+    module = load_generator()
+    root = fixture_root(tmp_path)
+    write_source(
+        tmp_path,
+        Path("agents", "seo-quoted.md"),
+        '---\ndescription: "Ranks #1 for SEO audits."\nmaxTurns: 15\ntools: Read\n---\n\nBody.\n',
+    )
+    write_source(
+        tmp_path,
+        Path("agents", "seo-quoted-comment.md"),
+        '---\ndescription: "Ranks #1."  # trailing note\nmaxTurns: 15\ntools: Read\n---\n\nBody.\n',
+    )
+    sources = {agent.id: agent for agent in module.discover_agents(root)}
+    assert sources["seo-quoted"].description == "Ranks #1 for SEO audits."
+    assert sources["seo-quoted-comment"].description == "Ranks #1."
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation needs extra privileges on Windows")
+def test_write_refuses_directory_symlink(tmp_path: Path) -> None:
+    module = load_generator()
+    root = fixture_root(tmp_path)
+    target = root / "outside-agents"
+    target.mkdir()
+    output = root / ".opencode" / "agents"
+    output.parent.mkdir(parents=True)
+    output.symlink_to(target, target_is_directory=True)
+    result = module.write_wrappers(root)
+    assert result["errors"]
+    assert not list(target.glob("*.md"))
