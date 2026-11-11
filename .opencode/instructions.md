@@ -80,3 +80,8 @@ mode must be `"manual"`. If it is not, unset `CLAUDE_PLUGIN_ROOT`,
 
 Run `/seo` from the Build agent. Plan mode restricts shell and edit tools.
 Subagents inherit the session model; use a strong model for long audits.
+
+For a full `/seo audit`, spawn every subagent that the audit skill lists
+without a spawn condition, even when the target limits what that subagent can
+measure. Report the limitation inside that subagent's findings instead of
+skipping the subagent. Conditional subagents still follow their conditions.
