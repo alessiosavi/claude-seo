@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 ADAPTER = ROOT / ".opencode"
@@ -60,3 +63,262 @@ def test_command_contract() -> None:
 def test_gitattributes_forces_lf() -> None:
     text = (ADAPTER / ".gitattributes").read_text(encoding="utf-8")
     assert "* text eol=lf" in text
+
+
+ADAPTER_SCRIPT = ROOT / ".opencode" / "adapter" / "build_agents.py"
+FIXTURE_ALPHA = "seo-alpha"
+FIXTURE_BETA = "seo-beta"
+FIXTURE_GAMMA = "seo-gamma"
+
+
+def write_source(root: Path, rel: str | Path, text: str) -> None:
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8", newline="\n")
+
+
+def fixture_root(tmp_path: Path) -> Path:
+    write_source(
+        tmp_path,
+        Path("agents", f"{FIXTURE_ALPHA}.md"),
+        """---
+name: seo-alpha
+description: >
+  Alpha agent that does
+  useful things.
+model: sonnet
+maxTurns: 35
+tools: Read, Bash, Write  # report output
+---
+
+Alpha body.
+""",
+    )
+    write_source(
+        tmp_path,
+        Path("agents", f"{FIXTURE_BETA}.md"),
+        """---
+name: seo-beta
+description: "Beta: quoted description."
+model: opus
+maxTurns: 15
+tools: Read, WebFetch
+---
+
+Beta body.
+""",
+    )
+    write_source(
+        tmp_path,
+        Path("extensions", "ext", "agents", f"{FIXTURE_GAMMA}.md"),
+        """---
+name: seo-gamma
+description: Gamma agent.
+model: sonnet
+maxTurns: 30
+tools:
+  - Read
+  - Glob
+---
+
+Gamma body.
+""",
+    )
+    write_source(
+        tmp_path,
+        Path("extensions", "ext", "agents", f"{FIXTURE_ALPHA}.md"),
+        """---
+name: seo-alpha
+description: Duplicate should be ignored.
+maxTurns: 99
+tools: Read
+---
+
+Duplicate body.
+""",
+    )
+    return tmp_path
+
+
+def load_generator():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("build_agents", ADAPTER_SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_parse_folded_quoted_and_plain_descriptions(tmp_path: Path) -> None:
+    module = load_generator()
+    root = fixture_root(tmp_path)
+    sources = {agent.id: agent for agent in module.discover_agents(root)}
+    assert sources["seo-alpha"].description == "Alpha agent that does useful things."
+    assert sources["seo-beta"].description == "Beta: quoted description."
+    assert sources["seo-gamma"].description == "Gamma agent."
+    assert sources["seo-alpha"].max_turns == 35
+    assert sources["seo-alpha"].tools == ("Read", "Bash", "Write")
+    assert sources["seo-gamma"].tools == ("Read", "Glob")
+    assert sources["seo-alpha"].source == Path("agents", f"{FIXTURE_ALPHA}.md")
+    assert len(sources) == 3
+
+
+def test_render_wrapper_has_native_frontmatter_and_least_privilege(tmp_path: Path) -> None:
+    module = load_generator()
+    root = fixture_root(tmp_path)
+    sources = {agent.id: agent for agent in module.discover_agents(root)}
+    beta = module.render_wrapper(sources["seo-beta"])
+    assert "mode: subagent" in beta
+    assert "steps: 16" in beta
+    assert "tools:" not in beta
+    assert "name:" not in beta
+    assert "model:" not in beta
+    assert "maxTurns" not in beta
+    assert "deny" in beta
+    assert "- { action: webfetch" in beta
+    assert "- { action: read" in beta
+    assert "- { action: skill" in beta
+    assert "- { action: shell" not in beta
+    assert "- { action: edit" not in beta
+    assert str(Path("agents", f"{FIXTURE_BETA}.md")) in beta
+    assert str(root) not in beta
+    assert "no shell access" in beta
+    assert "Run bundled tools as" not in beta
+
+    alpha = module.render_wrapper(sources["seo-alpha"])
+    assert "- { action: shell" in alpha
+    assert "- { action: edit" in alpha
+    assert "Run bundled tools as" in alpha
+    assert "./scripts/claude-seo" in alpha
+
+
+def test_write_is_idempotent_and_prunes_only_generated(tmp_path: Path) -> None:
+    module = load_generator()
+    root = fixture_root(tmp_path)
+    first = module.write_wrappers(root)
+    assert first["written"] == ["seo-alpha", "seo-beta", "seo-gamma"]
+    output = root / ".opencode" / "agents"
+    assert sorted(p.name for p in output.glob("*.md")) == [
+        f"{FIXTURE_ALPHA}.md",
+        f"{FIXTURE_BETA}.md",
+        f"{FIXTURE_GAMMA}.md",
+    ]
+    second = module.write_wrappers(root)
+    assert second["written"] == []
+    assert second["changed"] == []
+    stale = output / "seo-stale.md"
+    stale.write_text(
+        "---\n"
+        'description: "stale"\n'
+        "mode: subagent\n"
+        "steps: 2\n"
+        "permissions:\n"
+        '  - { action: "*", resource: "*", effect: deny }\n'
+        "---\n"
+        f"{module.GENERATED_MARKER}\nstale\n",
+        encoding="utf-8",
+    )
+    third = module.write_wrappers(root)
+    assert third["pruned"] == ["seo-stale"]
+    assert not stale.exists()
+
+
+def test_write_refuses_non_generated_file(tmp_path: Path) -> None:
+    module = load_generator()
+    root = fixture_root(tmp_path)
+    output = root / ".opencode" / "agents"
+    output.mkdir(parents=True)
+    keep = output / "keep.md"
+    keep.write_text("hand written\n", encoding="utf-8")
+    result = module.write_wrappers(root)
+    assert result["errors"]
+    assert keep.exists()
+    assert not (output / f"{FIXTURE_ALPHA}.md").exists()
+    assert module.main(["--check", "--root", str(root)]) == 1
+
+
+def test_check_detects_drift(tmp_path: Path) -> None:
+    module = load_generator()
+    root = fixture_root(tmp_path)
+    module.write_wrappers(root)
+    wrapper = root / ".opencode" / "agents" / f"{FIXTURE_ALPHA}.md"
+    wrapper.write_text(wrapper.read_text(encoding="utf-8") + "\ndrift\n", encoding="utf-8")
+    result = module.check_wrappers(root)
+    assert result["changed"] == [FIXTURE_ALPHA]
+    assert module.main(["--check", "--root", str(root)]) == 1
+
+
+def test_unknown_tool_is_an_error(tmp_path: Path) -> None:
+    module = load_generator()
+    root = fixture_root(tmp_path)
+    write_source(
+        tmp_path,
+        Path("agents", "seo-delta.md"),
+        "---\ndescription: Delta.\nmaxTurns: 15\ntools: Read, NotebookEdit\n---\n\nBody.\n",
+    )
+    with pytest.raises(ValueError, match="NotebookEdit"):
+        module.discover_agents(root)
+
+
+def test_duplicate_extension_agents_are_an_error(tmp_path: Path) -> None:
+    module = load_generator()
+    root = fixture_root(tmp_path)
+    for extension in ("a", "b"):
+        write_source(
+            tmp_path,
+            Path("extensions", extension, "agents", "seo-dup.md"),
+            "---\ndescription: Dup.\nmaxTurns: 15\ntools: Read\n---\n\nBody.\n",
+        )
+    with pytest.raises(ValueError, match="seo-dup"):
+        module.discover_agents(root)
+
+
+def test_json_output_has_required_keys(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    module = load_generator()
+    root = fixture_root(tmp_path)
+    module.write_wrappers(root)
+    assert module.main(["--check", "--json", "--root", str(root)]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert set(payload) == {
+        "written",
+        "changed",
+        "pruned",
+        "missing",
+        "stale",
+        "errors",
+        "sources",
+    }
+    assert {record["id"] for record in payload["sources"]} == {
+        FIXTURE_ALPHA,
+        FIXTURE_BETA,
+        FIXTURE_GAMMA,
+    }
+
+
+def test_output_uses_lf_bytes(tmp_path: Path) -> None:
+    module = load_generator()
+    root = fixture_root(tmp_path)
+    path = root / "agents" / "seo-crlf.md"
+    path.write_text(
+        "---\ndescription: CRLF agent.\nmaxTurns: 15\ntools: Read\n---\n\nBody.\n",
+        encoding="utf-8",
+        newline="\r\n",
+    )
+    module.write_wrappers(root)
+    data = (root / ".opencode" / "agents" / "seo-crlf.md").read_bytes()
+    assert b"\r\n" not in data
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation needs extra privileges on Windows")
+def test_write_refuses_symlink(tmp_path: Path) -> None:
+    module = load_generator()
+    root = fixture_root(tmp_path)
+    output = root / ".opencode" / "agents"
+    output.mkdir(parents=True)
+    target = root / "agents" / f"{FIXTURE_ALPHA}.md"
+    (output / f"{FIXTURE_ALPHA}.md").symlink_to(target)
+    result = module.write_wrappers(root)
+    assert result["errors"]
+    assert target.read_text(encoding="utf-8").startswith("---")
+    assert module.GENERATED_MARKER not in target.read_text(encoding="utf-8")
