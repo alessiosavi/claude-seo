@@ -184,7 +184,7 @@ def test_render_wrapper_has_native_frontmatter_and_least_privilege(tmp_path: Pat
     assert "- { action: skill" in beta
     assert "- { action: shell" not in beta
     assert "- { action: edit" not in beta
-    assert str(Path("agents", f"{FIXTURE_BETA}.md")) in beta
+    assert Path("agents", f"{FIXTURE_BETA}.md").as_posix() in beta
     assert str(root) not in beta
     assert "no shell access" in beta
     assert "Run bundled tools as" not in beta
