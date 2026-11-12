@@ -612,3 +612,29 @@ def test_write_refuses_directory_symlink(tmp_path: Path) -> None:
     result = module.write_wrappers(root)
     assert result["errors"]
     assert not list(target.glob("*.md"))
+
+
+def test_edit_tool_maps_to_edit_action(tmp_path: Path) -> None:
+    module = load_generator()
+    root = fixture_root(tmp_path)
+    write_source(
+        tmp_path,
+        Path("agents", "seo-edit.md"),
+        "---\ndescription: Edit agent.\nmaxTurns: 15\ntools: Read, Edit\n---\n\nBody.\n",
+    )
+    sources = {agent.id: agent for agent in module.discover_agents(root)}
+    assert sources["seo-edit"].tools == ("Read", "Edit")
+    text = module.render_wrapper(sources["seo-edit"])
+    assert "- { action: edit" in text
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation needs extra privileges on Windows")
+def test_write_accepts_symlinked_root(tmp_path: Path) -> None:
+    module = load_generator()
+    fixture_root(tmp_path)
+    link = tmp_path / "repo-link"
+    link.symlink_to(tmp_path, target_is_directory=True)
+    result = module.write_wrappers(link)
+    assert not result["errors"], result["errors"]
+    assert result["written"] == ["seo-alpha", "seo-beta", "seo-gamma"]
+    assert (tmp_path / ".opencode" / "agents" / "seo-alpha.md").is_file()

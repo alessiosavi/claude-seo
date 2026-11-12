@@ -27,6 +27,7 @@ TOOL_ACTIONS = {
     "Read": "read",
     "Bash": "shell",
     "Write": "edit",
+    "Edit": "edit",
     "Glob": "glob",
     "Grep": "grep",
     "WebFetch": "webfetch",
@@ -329,6 +330,7 @@ def _result(errors: list[str], sources: list[dict[str, str]]) -> dict[str, objec
 
 def check_wrappers(root: Path) -> dict[str, object]:
     """Report drift without writing. Never raises for on-disk problems."""
+    root = root.resolve()
     errors: list[str] = []
     try:
         expected = expected_wrappers(root)
@@ -374,6 +376,7 @@ def check_wrappers(root: Path) -> dict[str, object]:
 
 def write_wrappers(root: Path) -> dict[str, object]:
     """Write and prune wrappers. Any validation error leaves the tree untouched."""
+    root = root.resolve()
     errors: list[str] = []
     try:
         expected = expected_wrappers(root)
